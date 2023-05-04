@@ -1,5 +1,5 @@
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, RwLock};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::SystemTime;
 
@@ -17,8 +17,8 @@ use jsonwebtoken as jwt;
 use jsonwebtoken::Validation;
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
-use tokio::sync::broadcast;
-use axumlearn::{WebSocketStore, ws_handler};
+
+use axumlearn::{ChatState, ws_handler};
 
 const SECRET: &[u8] = b"deadbeef";
 static NEXT_ID: AtomicUsize = AtomicUsize::new(1);
@@ -76,18 +76,12 @@ async fn main() {
         ))
     };
 
-    // 服务器内部通讯
-    let (tx, _rx) = broadcast::channel(100);
-
-    let web_socket_store= Arc::new(WebSocketStore{
-        user_set: Mutex::new(Default::default()),
-        tx,
-    });
+    let chat_state = Arc::new(ChatState::new());
     let app = Router::new()
         .route("/", get(index_handler))
         .route("/todos", get(todos_handler).post(create_todo_handler).layer(Extension(store)))
         .route("/login", post(login_handler))
-        .route("/ws", get(ws_handler).layer(Extension(web_socket_store)))
+        .route("/ws", get(ws_handler).layer(Extension(chat_state)))
         .fallback(get(static_handler));
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 9812));

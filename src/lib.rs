@@ -1,89 +1,148 @@
-use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
-
+use std::sync::Arc;
 use axum::Extension;
 use axum::extract::WebSocketUpgrade;
 use axum::extract::ws::{Message, WebSocket};
 use axum::response::IntoResponse;
-use futures::{sink::SinkExt, stream::StreamExt};
+
+use dashmap::{DashMap, DashSet};
+use futures::{SinkExt, StreamExt};
 use tokio::sync::broadcast;
+use tracing::warn;
+use tracing_subscriber::util::SubscriberInitExt;
 
 pub use msg::{Msg, MsgData};
 
 mod msg;
 
+const CAPACITY: usize = 64;
 
 #[derive(Debug)]
-pub struct WebSocketStore {
-    pub user_set: Mutex<HashSet<String>>,
-    pub tx: broadcast::Sender<String>,
+struct State {
+    user_rooms: DashMap<String, DashSet<String>>,
+    room_users: DashMap<String, DashSet<String>>,
+    tx: broadcast::Sender<Arc<Msg>>,
 }
 
-#[derive(Clone)]
-pub struct AppStore(Arc<WebSocketStore>);
+#[derive(Clone, Default)]
+pub struct ChatState(Arc<State>);
 
-
-pub async fn ws_handler(ws: WebSocketUpgrade, Extension(websocket_store): Extension<AppStore>) -> impl IntoResponse {
-    ws.on_upgrade(|socket| { websocket(socket, websocket_store) })
+impl Default for State {
+    fn default() -> Self {
+        let (tx, _rx) = broadcast::channel(CAPACITY);
+        Self {
+            user_rooms: Default::default(),
+            room_users: Default::default(),
+            tx,
+        }
+    }
 }
 
-async fn websocket(socket: WebSocket, websocket_store: AppStore) {
-    // 服务器和客户端(浏览器)通讯
+impl ChatState {
+    pub fn new() -> Self {
+        Self(Arc::new(Default::default()))
+    }
+
+    pub fn get_user_rooms(&self, username: &str) -> Vec<String> {
+        self.0.user_rooms
+            .get(username)
+            .map(|v| v.clone().into_iter().collect())
+            .unwrap_or_default()
+    }
+
+    pub fn get_room_users(&self, room: &str) -> Vec<String>{
+        self.0.room_users
+            .get(room)
+            .map(|v| v.clone().into_iter().collect())
+            .unwrap_or_default()
+    }
+}
+
+
+pub async fn ws_handler(ws: WebSocketUpgrade, Extension(state): Extension<ChatState>) -> impl IntoResponse{
+    ws.on_upgrade(|socket| handle_websocket(socket, state))
+}
+
+async fn handle_websocket(socket: WebSocket, state: ChatState) {
+    let mut rx = state.0.tx.subscribe();
     let (mut sender, mut receiver) = socket.split();
 
-    let mut username = String::new();
-
-    while let Some(Ok(msg)) = receiver.next().await {
-        if let Message::Text(name) = msg {
-            check_user_name(&mut username, name.as_ref(), &websocket_store.0);
-            if username.is_empty() {
-                // 用户名已存在
-                break;
-            } else {
-                let _ = sender.send(Message::Text(String::from("username already taken"))).await;
-                return;
+    let state1 = state.clone();
+    let mut recv_task = tokio::spawn(async move{
+        while let Some(Ok(data)) = receiver.next().await {
+            if let Message::Text(msg) = data {
+                // 循环了，所以需要 state1.clone(), clone比较轻量，因为只是Arc的克隆
+                handle_message(msg.as_str().try_into().unwrap(), state1.clone()).await
             }
         }
-    }
-
-    let mut rx = websocket_store.0.tx.subscribe();
-
-    // 广播到大厅 username joined
-    let _ = websocket_store.0.tx.send(format!("{username} joined"));
+    });
 
     let mut send_task = tokio::spawn(async move {
-        // 接收大厅的消息，发送给浏览器客户端
         while let Ok(msg) = rx.recv().await {
-            if sender.send(Message::Text(msg)).await.is_err() {
+            if let Err(e) = sender.send(Message::Text(msg.as_ref().try_into().unwrap())).await {
+                warn!("error sending message: {e}");
                 break;
             }
         }
     });
 
-    let tx = websocket_store.0.tx.clone();
-    let name = username.clone();
-
-    let mut recv_task = tokio::spawn(async move {
-        // 接收浏览器客户端的消息，发送到大厅
-        while let Some(Ok(Message::Text(msg))) = receiver.next().await {
-            let _ = tx.send(format!("{name} said: {msg}"));
-        }
-    });
-
-    // If any one of the tasks run to completion, we abort the other
     tokio::select! {
-        _ = (&mut send_task) => recv_task.abort(),
-        _ = (&mut recv_task) => send_task.abort(),
+        _v1 = &mut recv_task => send_task.abort(),
+        _v2 = &mut send_task => recv_task.abort(),
     }
 
-    // 广播到大厅 username left
-    let _ = websocket_store.0.tx.send(format!("{username} left"));
-    websocket_store.0.user_set.lock().unwrap().remove(&username);
+    warn!("connection closed");
+
+    // this user has left. should send a leave message to all rooms
+    // usually we can get username from auth header, here we just use 'fake_name'
+    let username = "fake_name";
+    let mut msg = Msg::new("fake_room".into(), username.into(), MsgData::Leave);
+    for room in state.get_user_rooms(username){
+        if let Err(e) = state.0.tx.send(Arc::new(Msg::leave(&room, username))) {
+            warn!("error sending leave message: {e}")
+        }
+    }
+
 }
 
-fn check_user_name(username_string: &mut String, name: &str, websocket_store: &Arc<WebSocketStore>) {
-    let user_set = websocket_store.user_set.lock().unwrap();
-    if !user_set.contains(name) {
-        username_string.push_str(name)
+async fn handle_message(msg: Msg, state: ChatState){
+    let msg = match msg.data {
+        MsgData::Join => {
+            state
+                .0
+                .room_users
+                .entry(msg.room.clone())
+                .or_insert_with(DashSet::new)
+                .insert(msg.username.clone());
+            state
+                .0
+                .user_rooms
+                .entry(msg.username.clone())
+                .or_insert_with(DashSet::new)
+                .insert(msg.room.clone());
+            msg
+        }
+        MsgData::Leave => {
+            if let Some(v)   = state.0.user_rooms.get_mut(&msg.username){
+                v.remove(&msg.room);
+                if v.is_empty(){
+                    state.0.user_rooms.remove(&msg.username);
+                }
+            }
+            if let Some(v) = state.0.room_users.get(&msg.room){
+                v.remove(&msg.username);
+                if v.is_empty(){
+                    state.0.room_users.remove(&msg.room);
+                }
+            }
+            msg
+        }
+        MsgData::Msg(_) => {
+            msg
+        }
+    };
+
+    if let Err(e) = state.0.tx.send(Arc::new(msg)){
+        warn!("error sending message: {e}");
     }
+
 }
